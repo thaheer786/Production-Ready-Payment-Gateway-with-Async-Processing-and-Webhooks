@@ -1,0 +1,333 @@
+# Submission Configuration for Automated Evaluation
+
+# Project Information
+name: Production-Ready Payment Gateway with Async Processing and Webhooks
+version: 1.0.0
+description: Full-featured payment gateway with async processing, webhooks, embeddable SDK, and merchant dashboard
+
+# Setup Commands
+setup:
+  - command: docker-compose --version
+    description: Verify Docker Compose is installed
+    
+  - command: docker --version
+    description: Verify Docker is installed
+
+# Start Commands
+start:
+  - command: docker-compose up -d --build
+    description: Build and start all services (API, Worker, Dashboard, Checkout, PostgreSQL, Redis)
+    timeout: 300
+    
+  - command: sleep 60
+    description: Wait for services to initialize
+    
+  - command: docker-compose ps
+    description: Verify all services are running
+
+# Health Check Commands
+verify:
+  - command: curl -f http://localhost:8000/health
+    description: Check API service health
+    expected: '{"status":"UP"}'
+    
+  - command: curl -f http://localhost:3000
+    description: Check Dashboard is accessible
+    
+  - command: curl -f http://localhost:3001/checkout.html
+    description: Check Checkout widget is accessible
+    
+  - command: docker-compose exec -T postgres pg_isready -U gateway_user -d payment_gateway
+    description: Verify PostgreSQL database connection
+    
+  - command: docker-compose exec -T redis redis-cli ping
+    description: Verify Redis connection
+    expected: PONG
+
+# Test Commands
+test:
+  # Test Order Creation
+  - command: |
+      curl -X POST http://localhost:8000/api/v1/orders \
+        -H "X-Api-Key: key_test_abc123" \
+        -H "X-Api-Secret: secret_test_xyz789" \
+        -H "Content-Type: application/json" \
+        -d '{"amount": 50000, "currency": "INR", "receipt": "test_receipt"}'
+    description: Test order creation endpoint
+    expected_status: 201
+    
+  # Test Payment Creation with Idempotency
+  - command: |
+      ORDER_ID=$(curl -s -X POST http://localhost:8000/api/v1/orders \
+        -H "X-Api-Key: key_test_abc123" \
+        -H "X-Api-Secret: secret_test_xyz789" \
+        -H "Content-Type: application/json" \
+        -d '{"amount": 50000, "currency": "INR"}' | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+      curl -X POST http://localhost:8000/api/v1/payments \
+        -H "X-Api-Key: key_test_abc123" \
+        -H "X-Api-Secret: secret_test_xyz789" \
+        -H "Idempotency-Key: test_idempotency_key_001" \
+        -H "Content-Type: application/json" \
+        -d "{\"order_id\": \"$ORDER_ID\", \"method\": \"upi\", \"vpa\": \"test@paytm\"}"
+    description: Test payment creation with idempotency key
+    expected_status: 201
+    
+  # Test Job Queue Status
+  - command: curl -s http://localhost:8000/api/v1/test/jobs/status
+    description: Test job queue status endpoint
+    expected_fields: ["pending", "processing", "completed", "failed", "worker_status"]
+    
+  # Test Webhook Logs
+  - command: |
+      curl -s http://localhost:8000/api/v1/webhooks?limit=10&offset=0 \
+        -H "X-Api-Key: key_test_abc123" \
+        -H "X-Api-Secret: secret_test_xyz789"
+    description: Test webhook logs endpoint
+    expected_status: 200
+    
+  # Test Refund Creation
+  - command: |
+      sleep 15
+      PAYMENT_ID=$(curl -s http://localhost:8000/api/v1/payments \
+        -H "X-Api-Key: key_test_abc123" \
+        -H "X-Api-Secret: secret_test_xyz789" | grep -o '"id":"pay_[^"]*"' | head -1 | cut -d'"' -f4)
+      if [ ! -z "$PAYMENT_ID" ]; then
+        curl -X POST "http://localhost:8000/api/v1/payments/$PAYMENT_ID/refunds" \
+          -H "X-Api-Key: key_test_abc123" \
+          -H "X-Api-Secret: secret_test_xyz789" \
+          -H "Content-Type: application/json" \
+          -d '{"amount": 10000, "reason": "Test refund"}'
+      fi
+    description: Test refund creation (after payment processing)
+    expected_status: 201
+
+# Cleanup Commands
+shutdown:
+  - command: docker-compose down
+    description: Stop all services
+    
+  - command: docker-compose down -v
+    description: Stop and remove volumes (optional, for full cleanup)
+
+# Service Endpoints
+endpoints:
+  api:
+    url: http://localhost:8000
+    health: /health
+    
+  dashboard:
+    url: http://localhost:3000
+    
+  checkout:
+    url: http://localhost:3001
+    
+  postgres:
+    host: localhost
+    port: 5432
+    database: payment_gateway
+    user: gateway_user
+    
+  redis:
+    host: localhost
+    port: 6379
+
+# Expected Service Behavior
+services:
+  - name: postgres
+    status: healthy
+    startup_time: 30
+    
+  - name: redis
+    status: healthy
+    startup_time: 10
+    
+  - name: api
+    status: healthy
+    startup_time: 60
+    depends_on: [postgres, redis]
+    
+  - name: worker
+    status: running
+    startup_time: 70
+    depends_on: [postgres, redis, api]
+    
+  - name: dashboard
+    status: running
+    startup_time: 40
+    
+  - name: checkout
+    status: running
+    startup_time: 40
+
+# Database Schema Validation
+database:
+  tables:
+    - merchants
+    - orders
+    - payments
+    - refunds
+    - webhook_logs
+    - idempotency_keys
+    
+  required_fields:
+    merchants: [id, name, email, api_key, api_secret, webhook_url, webhook_secret]
+    orders: [id, merchant_id, amount, currency, status]
+    payments: [id, order_id, merchant_id, amount, method, status, captured]
+    refunds: [id, payment_id, merchant_id, amount, status]
+    webhook_logs: [id, merchant_id, event, payload, status, attempts]
+    idempotency_keys: [key, merchant_id, response, expires_at]
+
+# API Contract Validation
+api_contracts:
+  - endpoint: POST /api/v1/orders
+    requires_auth: true
+    request_body: { amount: integer, currency: string, receipt: string }
+    response_status: 201
+    response_fields: [id, merchant_id, amount, currency, status, created_at]
+    
+  - endpoint: POST /api/v1/payments
+    requires_auth: true
+    optional_headers: [Idempotency-Key]
+    request_body: { order_id: string, method: string }
+    response_status: 201
+    response_fields: [id, order_id, amount, method, status, created_at]
+    
+  - endpoint: POST /api/v1/payments/{id}/capture
+    requires_auth: true
+    request_body: { amount: integer }
+    response_status: 200
+    response_fields: [id, status, captured]
+    
+  - endpoint: POST /api/v1/payments/{payment_id}/refunds
+    requires_auth: true
+    request_body: { amount: integer, reason: string }
+    response_status: 201
+    response_fields: [id, payment_id, amount, status]
+    
+  - endpoint: GET /api/v1/refunds/{id}
+    requires_auth: true
+    response_status: 200
+    response_fields: [id, payment_id, amount, status]
+    
+  - endpoint: GET /api/v1/webhooks
+    requires_auth: true
+    query_params: { limit: integer, offset: integer }
+    response_status: 200
+    response_fields: [data, total, limit, offset]
+    
+  - endpoint: POST /api/v1/webhooks/{id}/retry
+    requires_auth: true
+    response_status: 200
+    response_fields: [id, status, message]
+    
+  - endpoint: GET /api/v1/test/jobs/status
+    requires_auth: false
+    response_status: 200
+    response_fields: [pending, processing, completed, failed, worker_status]
+
+# Frontend Validation
+frontend:
+  dashboard:
+    routes:
+      - /
+      - /payments
+      - /webhooks
+      - /docs
+    
+    required_elements:
+      webhooks_page:
+        - data-test-id: webhook-config
+        - data-test-id: webhook-config-form
+        - data-test-id: webhook-url-input
+        - data-test-id: webhook-secret
+        - data-test-id: regenerate-secret-button
+        - data-test-id: save-webhook-button
+        - data-test-id: test-webhook-button
+        - data-test-id: webhook-logs-table
+        - data-test-id: webhook-log-item
+        
+      docs_page:
+        - data-test-id: api-docs
+        - data-test-id: section-create-order
+        - data-test-id: section-sdk-integration
+        - data-test-id: section-webhook-verification
+        - data-test-id: code-snippet-create-order
+        - data-test-id: code-snippet-sdk
+        - data-test-id: code-snippet-webhook
+  
+  sdk:
+    required_elements:
+      - data-test-id: payment-modal
+      - data-test-id: payment-iframe
+      - data-test-id: close-modal-button
+    
+    global_object: PaymentGateway
+    
+    methods:
+      - open
+      - close
+
+# Job Processing Validation
+job_processing:
+  payment_worker:
+    queue: payment-jobs
+    processing_delay: 5-10 seconds (or TEST_PROCESSING_DELAY)
+    success_rate:
+      upi: 90%
+      card: 95%
+    test_mode: supports TEST_MODE and TEST_PAYMENT_SUCCESS
+    
+  webhook_worker:
+    queue: webhook-jobs
+    signature_algorithm: HMAC-SHA256
+    retry_attempts: 5
+    retry_schedule: [0, 60, 300, 1800, 7200] seconds
+    test_mode: supports WEBHOOK_RETRY_INTERVALS_TEST
+    
+  refund_worker:
+    queue: refund-jobs
+    processing_delay: 3-5 seconds
+
+# Evaluation Criteria
+evaluation:
+  automated_tests:
+    weight: 40%
+    criteria:
+      - All API endpoints return correct responses
+      - Database schema matches specification
+      - Frontend elements have required data-test-id attributes
+      - Services start successfully
+      - Job queue processing works correctly
+      
+  code_review:
+    weight: 30%
+    criteria:
+      - Clean architecture and code organization
+      - Proper error handling
+      - Security best practices (HMAC signatures)
+      - Async processing patterns
+      - Job retry logic implementation
+      
+  system_design:
+    weight: 20%
+    criteria:
+      - Understanding of async patterns
+      - Webhook delivery mechanisms
+      - Idempotency implementation
+      - Scalability considerations
+      
+  documentation:
+    weight: 10%
+    criteria:
+      - Comprehensive README
+      - Clear API documentation
+      - Integration guides
+      - Architecture diagrams
+
+# Notes for Evaluators
+notes: |
+  1. First build takes 2-3 minutes - please wait for all services to be healthy
+  2. Worker service processes jobs in background - allow 10-15 seconds for payment processing
+  3. Test mode environment variables can be set for deterministic testing
+  4. Webhook retry intervals can be shortened using WEBHOOK_RETRY_INTERVALS_TEST=true
+  5. Default test merchant credentials are pre-configured in database seed
